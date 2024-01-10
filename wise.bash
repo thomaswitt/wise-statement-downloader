@@ -12,6 +12,13 @@ else
   URL_PREFIX='https://api.transferwise.com'
 fi
 
+# Check for numeric year argument
+if [[ "$1" =~ ^[0-9]{4}$ ]]; then
+  SELECTED_YEAR="$1"
+  echo -e "Downloading all statements for the year $SELECTED_YEAR"
+fi
+
+
 choose_and_set_id() {
   local output="$1"
   local i=1
@@ -58,6 +65,82 @@ perform_request() {
   eval curl -s ${FLAGS} ${AUTH_HEADERS} "${URL_PREFIX}${URI}"
 }
 
+get_account_creation_year() {
+    local all_accounts="$1"
+    local account_id="$2"
+    echo "$all_accounts" \
+      | grep -F ": $account_id" \
+      | sed -n "s/.*(\([0-9]\{4\}\)).*/\1/p"
+}
+
+extract_year_and_fullname() {
+    local all_accounts="$1"
+    local account_id="$2"
+
+    # Skip year selection if SELECTED_YEAR is already set
+    if [ -z "$SELECTED_YEAR" ]; then
+        CREATION_YEAR=$(get_account_creation_year "$all_accounts" "$account_id")
+        CURRENT_YEAR=$(date +%Y)
+        YEAR_CHOICES=""
+        for ((year=CREATION_YEAR; year<=CURRENT_YEAR; year++)); do
+          YEAR_CHOICES+="$year\n"
+        done
+        echo -e "\nChoose year for the statement:"
+        choose_and_set_id "$(echo -e "$YEAR_CHOICES")"
+        SELECTED_YEAR=${CHOSEN_ID}
+    fi
+
+    # Extract account fullname for later
+    ACCOUNT_FULLNAME=$(echo "$all_accounts" | grep -F ": $account_id" | sed -E 's/^([^:]+) \([0-9]{4}\): [0-9]+/\1/')
+}
+
+process_account() {
+    local account_id="$1"
+    local all_accounts="$2"
+    local prefix="$3"
+
+    CREATION_YEAR=$(get_account_creation_year "$all_accounts" "$account_id")
+    extract_year_and_fullname "$all_accounts" "$account_id"
+
+    if [[ "$CREATION_YEAR" -le "$SELECTED_YEAR" ]]; then
+        echo -e "\nProcessing Account: ${ACCOUNT_FULLNAME}"
+        CURRENCIES_OUTPUT=$(perform_request "/v4/profiles/${account_id}/balances?types=STANDARD" \
+          | jq -r '.[] | "\(.currency): \(.id)"' | sort)
+        while read -r currency_line; do
+          WISE_BALANCE_ID="${currency_line##*: }"
+          CURRENCY="${currency_line%: *}"
+          if [ -z "$CURRENCY" ]; then
+            echo "  * No statement available"
+          else
+            echo -n "  - ${CURRENCY}: "
+
+            account_filename=$(echo "$ACCOUNT_FULLNAME" | sed 's/[^a-zA-Z0-9 ]//g' | tr -s " " | tr ' ' '_' | sed 's/^_//;s/_$//')
+            OUTPUT_FILE_PREFIX="${prefix}Wise-${account_id}-${account_filename}-${CURRENCY}-${SELECTED_YEAR}"
+            echo -n "${OUTPUT_FILE_PREFIX}:"
+
+            for extension in pdf xlsx csv; do
+              STATEMENT_DETAILS="intervalStart=${SELECTED_YEAR}-01-01T00:00:00.000Z\&intervalEnd=${SELECTED_YEAR}-12-31T23:59:59.999Z\&type=COMPACT"
+              OUTPUT=$(perform_request "/v1/profiles/${account_id}/balance-statements/${WISE_BALANCE_ID}/statement.${extension}?${STATEMENT_DETAILS}" "-I")
+
+              REQ=$(echo "$OUTPUT" |  grep 'x-2fa-approval: ')
+              REQ_ID=$(echo "${REQ##*: }" | tr -d '[:space:]')
+              REQ_SIGNATURE=$(printf "${REQ_ID}" | openssl sha256 -sign ${PRIVATE_CERT} | openssl base64 -A | tr -d '\n')
+              ADDITIONAL_HEADERS="-H \"x-2fa-approval: ${REQ_ID}\" -H \"X-Signature: ${REQ_SIGNATURE}\""
+
+              echo -n " ${extension}"
+              perform_request "/v1/profiles/${account_id}/balance-statements/${WISE_BALANCE_ID}/statement.${extension}?${STATEMENT_DETAILS}" "${ADDITIONAL_HEADERS} -o ${OUTPUT_FILE_PREFIX}.${extension}"
+            done
+            echo ""
+          fi
+        done <<< "$CURRENCIES_OUTPUT"
+    else
+        echo -e "\nSkipping: $ACCOUNT_FULLNAME (created in $CREATION_YEAR which is later than $SELECTED_YEAR)"
+    fi
+}
+
+
+#####################################################################
+
 if [ -z "${WISE_API_TOKEN}" ]; then
   read -s -p "WISE Personal API Token: " WISE_API_TOKEN
   echo
@@ -70,48 +153,24 @@ if [[ $? -ne 0 ]]; then
   exit 1
 fi
 
-OUTPUT=$(perform_request "/v2/profiles" \
+ALL_ACCOUNTS=$(perform_request "/v2/profiles" \
   | jq -r '.[] | "\(.fullName) (\(.createdAt[0:4])): \(.id)"' | sort)
-echo "Choose account:"
-choose_and_set_id "$OUTPUT"
-WISE_P=${CHOSEN_ID}
 
-# Extract the creation year of the account
-ACCOUNT_CREATION_YEAR=$(echo "$OUTPUT" | sed -n "/$WISE_P/s/.*(\([0-9]\{4\}\)).*/\1/p")
-CURRENT_YEAR=$(date +%Y)
-YEAR_CHOICES=""
-for ((year=ACCOUNT_CREATION_YEAR; year<=CURRENT_YEAR; year++)); do
-  YEAR_CHOICES+="$year\n"
+declare -A ACCOUNT_IDS
+if [ -z "$SELECTED_YEAR" ]; then
+    echo "Choose account:"
+    choose_and_set_id "$ALL_ACCOUNTS"
+    ACCOUNT_IDS["$CHOSEN_ID"]=1
+else
+    while read -r line; do
+        id="${line##*: }"
+        ACCOUNT_IDS["$id"]=1
+    done <<< "$ALL_ACCOUNTS"
+fi
+
+# Loop through each account ID
+mkdir -p output
+for id in "${!ACCOUNT_IDS[@]}"; do
+  process_account "$id" "$ALL_ACCOUNTS" "output/"
 done
 
-# Extract account fullname for later
-ACCOUNT_FULLNAME=$(echo $CHOSEN_VALUE | sed 's/\(.*\) ([0-9]\{4\})/\1/' | sed 's/[^a-zA-Z0-9 ]//g' | tr -s " " | tr ' ' '_' | sed 's/^_//;s/_$//')
-
-echo -e "\nChoose year for the statement:"
-choose_and_set_id "$(echo -e "$YEAR_CHOICES")"
-SELECTED_YEAR=${CHOSEN_ID}
-
-# Fetch currencies and balances for the selected profile
-CURRENCIES_OUTPUT=$(perform_request "/v4/profiles/${WISE_P}/balances?types=STANDARD" \
-  | jq -r '.[] | "\(.currency): \(.id)"' | sort)
-
-# Loop through each currency and download the statement
-while read -r currency_line; do
-  WISE_BALANCE_ID="${currency_line##*: }"
-  CURRENCY="${currency_line%: *}"
-  echo "Downloading statement for currency: ${CURRENCY}"
-
-  STATEMENT_DETAILS="intervalStart=${SELECTED_YEAR}-01-01T00:00:00.000Z\&intervalEnd=${SELECTED_YEAR}-12-31T23:59:59.999Z\&type=COMPACT"
-  OUTPUT=$(perform_request "/v1/profiles/${WISE_P}/balance-statements/${WISE_BALANCE_ID}/statement.pdf?${STATEMENT_DETAILS}" "-I")
-
-  REQ=$(echo "$OUTPUT" |  grep 'x-2fa-approval: ')
-  REQ_ID=$(echo "${REQ##*: }" | tr -d '[:space:]')
-  REQ_SIGNATURE=$(printf "${REQ_ID}" | openssl sha256 -sign ${PRIVATE_CERT} | openssl base64 -A | tr -d '\n')
-  ADDITIONAL_HEADERS="-H \"x-2fa-approval: ${REQ_ID}\" -H \"X-Signature: ${REQ_SIGNATURE}\""
-
-  OUTPUT_FILE="output/Wise-${WISE_P}-${ACCOUNT_FULLNAME}-${CURRENCY}-${SELECTED_YEAR}.pdf"
-  mkdir -p output
-
-  echo -e "*** Writing PDF file to ${OUTPUT_FILE}"
-  perform_request "/v1/profiles/${WISE_P}/balance-statements/${WISE_BALANCE_ID}/statement.pdf?${STATEMENT_DETAILS}" "${ADDITIONAL_HEADERS} -o ${OUTPUT_FILE}"
-done <<< "$CURRENCIES_OUTPUT"
