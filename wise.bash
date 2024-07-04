@@ -115,7 +115,7 @@ process_account() {
             echo -n "  - ${CURRENCY}: "
 
             account_filename=$(echo "$ACCOUNT_FULLNAME" | sed 's/[^a-zA-Z0-9 ]//g' | tr -s " " | tr ' ' '_' | sed 's/^_//;s/_$//')
-            OUTPUT_FILE_PREFIX="${prefix}Wise-${account_id}-${account_filename}-${CURRENCY}-${SELECTED_YEAR}"
+            OUTPUT_FILE_PREFIX="${prefix}/Wise-${account_id}-${account_filename}-${CURRENCY}-${SELECTED_YEAR}"
             echo -n "${OUTPUT_FILE_PREFIX}:"
 
             for extension in pdf xlsx csv; do
@@ -169,8 +169,9 @@ else
 fi
 
 # Loop through each account ID
-mkdir -p output
+DLDIR=~/Downloads/wise-statements
+mkdir -p "$DLDIR"
 for id in "${!ACCOUNT_IDS[@]}"; do
-  process_account "$id" "$ALL_ACCOUNTS" "output/"
+  process_account "$id" "$ALL_ACCOUNTS" "$DLDIR"
 done
 
